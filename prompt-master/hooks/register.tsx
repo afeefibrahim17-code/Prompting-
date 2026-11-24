@@ -26,6 +26,10 @@ const flow = atom({ plugin: 'prompt-master', key: 'flow' } as const, IDLE, {
 // Bumped on every new run or close, so a slow model reply from an old run is dropped.
 let run = 0
 
+// Which apps have asked to draw the button, for /prompt-master with nothing typed.
+const seen = new Set<string>()
+const LOG = '/tmp/claude-0/-home-user-Prompting-/ccaa8bf0-9048-545a-8d31-554ce9b5298c/scratchpad/prompt-master-surfaces.txt'
+
 const READ_SYSTEM = `You help someone improve a rough prompt they are about to send to Claude.
 
 Read their prompt and work out what they are actually trying to get done.
@@ -209,7 +213,8 @@ export const register: Register = on => {
   on('command.run', { command: 'prompt-master' }, async ($, e) => {
     const text = e.args.trim() !== '' ? e.args : (await $.prompt.read()).text
     if (text.trim() === '') {
-      return { text: 'Type /prompt-master followed by your rough prompt, e.g. /prompt-master write a post about our launch' }
+      const where = seen.size > 0 ? `The ✦ Prompt Master button is being drawn in: ${[...seen].join(', ')}.` : 'No app has drawn the ✦ Prompt Master button in this session yet.'
+      return { text: `${where} Type /prompt-master followed by your rough prompt, e.g. /prompt-master write a post about our launch` }
     }
     void start($, text)
 
@@ -217,12 +222,15 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!seen.has(e.surface)) {
+      seen.add(e.surface)
+      void $.fs.write(LOG, [...seen].join('\n')).catch(() => undefined)
+    }
     if (e.props.hasSurvey) return next(e)
     const { Box, Button, Input, Text } = $.ui.resolve(e)
     const f = await read($, flow)
 
     if (f.phase === 'idle') {
-      if (e.props.isWorking) return next(e)
       return (
         <Box>
           <Button
