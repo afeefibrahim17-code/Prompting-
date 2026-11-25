@@ -104,32 +104,60 @@ const close = async ($: EngineInterface) => {
   await update($, flow, () => IDLE)
 }
 
-const write = async ($: EngineInterface, mine: number) => {
-  const f = await read($, flow)
-  await update($, flow, (x): Flow => ({ ...x, phase: 'writing' }))
-  const answered = f.answers.filter(a => a.answer !== '')
+// The two model steps, shared by the band (apps that draw it) and the dialog (apps that don't).
+const readPrompt = async ($: EngineInterface, original: string) => {
+  const out = (await ask($, READ_SYSTEM, `Their rough prompt:\n"""\n${original}\n"""`)) as {
+    goal?: unknown
+    questions?: unknown
+  }
+  const questions: Question[] = (Array.isArray(out.questions) ? out.questions : [])
+    .filter(
+      (q): q is { question: string; options?: unknown } =>
+        typeof q === 'object' && q !== null && typeof (q as { question?: unknown }).question === 'string',
+    )
+    .slice(0, 3)
+    .map(q => ({
+      question: q.question,
+      options: [
+        ...new Set(
+          (Array.isArray(q.options) ? q.options : [])
+            .filter((o): o is string => typeof o === 'string' && o.trim() !== '' && o.trim().toLowerCase() !== 'skip')
+            .map(o => o.trim()),
+        ),
+      ].slice(0, 3),
+    }))
+  const goal = typeof out.goal === 'string' ? out.goal : ''
+
+  return { goal, questions }
+}
+
+const rewrite = async ($: EngineInterface, original: string, goal: string, answers: Answer[]) => {
+  const answered = answers.filter(a => a.answer !== '')
+  const skipped = answers.filter(a => a.answer === '')
   const prompt = [
-    `Their rough prompt:\n"""\n${f.original}\n"""`,
-    f.goal ? `What they seem to be trying to do: ${f.goal}` : '',
+    `Their rough prompt:\n"""\n${original}\n"""`,
+    goal ? `What they seem to be trying to do: ${goal}` : '',
     answered.length > 0
       ? `Their answers to your questions:\n${answered.map(a => `- ${a.question} ${a.answer}`).join('\n')}`
       : 'They gave no extra answers.',
-    f.answers.some(a => a.answer === '')
-      ? `They skipped: ${f.answers.filter(a => a.answer === '').map(a => a.question).join(' / ')}`
-      : '',
+    skipped.length > 0 ? `They skipped: ${skipped.map(a => a.question).join(' / ')}` : '',
   ]
     .filter(Boolean)
     .join('\n\n')
+  const out = (await ask($, WRITE_SYSTEM, prompt)) as { prompt?: unknown; note?: unknown }
+  const improved = typeof out.prompt === 'string' ? out.prompt.trim() : ''
+  if (improved === '') throw new Error('No improved prompt came back. Try again.')
+  const note = typeof out.note === 'string' ? out.note.trim() : ''
 
+  return { improved, note }
+}
+
+const write = async ($: EngineInterface, mine: number) => {
+  const f = await read($, flow)
+  await update($, flow, (x): Flow => ({ ...x, phase: 'writing' }))
   try {
-    const out = (await ask($, WRITE_SYSTEM, prompt)) as {
-      prompt?: unknown
-      note?: unknown
-    }
+    const { improved, note } = await rewrite($, f.original, f.goal, f.answers)
     if (mine !== run) return
-    const improved = typeof out.prompt === 'string' ? out.prompt.trim() : ''
-    if (improved === '') throw new Error('No improved prompt came back. Try again.')
-    const note = typeof out.note === 'string' ? out.note.trim() : ''
     await update($, flow, (x): Flow => ({ ...x, phase: 'result', improved, note }))
   } catch (err) {
     await fail($, mine, err)
@@ -147,24 +175,8 @@ const start = async ($: EngineInterface, text: string) => {
   await update($, flow, (): Flow => ({ ...IDLE, phase: 'reading', original }))
 
   try {
-    const out = (await ask($, READ_SYSTEM, `Their rough prompt:\n"""\n${original}\n"""`)) as {
-      goal?: unknown
-      questions?: unknown
-    }
+    const { goal, questions } = await readPrompt($, original)
     if (mine !== run) return
-    const questions: Question[] = (Array.isArray(out.questions) ? out.questions : [])
-      .filter(
-        (q): q is { question: string; options?: unknown } =>
-          typeof q === 'object' && q !== null && typeof (q as { question?: unknown }).question === 'string',
-      )
-      .slice(0, 3)
-      .map(q => ({
-        question: q.question,
-        options: (Array.isArray(q.options) ? q.options : [])
-          .filter((o): o is string => typeof o === 'string' && o.trim() !== '')
-          .slice(0, 3),
-      }))
-    const goal = typeof out.goal === 'string' ? out.goal : ''
     await update($, flow, (f): Flow => ({ ...f, goal, questions, index: 0 }))
     if (questions.length === 0) {
       await write($, mine)
@@ -173,6 +185,72 @@ const start = async ($: EngineInterface, text: string) => {
     }
   } catch (err) {
     await fail($, mine, err)
+  }
+}
+
+// For apps that don't draw the band above the prompt box: the same steps in the
+// app's own question cards, and the result as a note in the conversation.
+const HEADER = 'Prompt'
+const putInBox = async ($: EngineInterface, text: string, done: string) => {
+  const filled = await $.prompt.fill({ text, mode: 'replace' }).catch(() => ({ isFilled: false }))
+  if (filled.isFilled) {
+    $.ui.log(done)
+    return
+  }
+  const copied = await $.ui.copy({ text }).catch(() => ({ isCopied: false }))
+  $.ui.log(
+    copied.isCopied
+      ? '✦ Prompt Master could not reach your prompt box, so it copied the better prompt. Paste it into the box, then press send.'
+      : '✦ Prompt Master could not reach your prompt box. Copy the better prompt above into the box, then press send.',
+  )
+}
+
+const startDialog = async ($: EngineInterface, text: string) => {
+  const original = text.trim()
+  run += 1
+  await update($, flow, () => IDLE)
+  try {
+    $.ui.status('✦ Prompt Master: reading your prompt…')
+    const { goal, questions } = await readPrompt($, original)
+    $.ui.status(undefined)
+
+    const answers: Answer[] = []
+    for (const q of questions) {
+      const options = q.options.length > 0 ? [...q.options, 'Skip'] : ['Skip', 'Not sure yet']
+      const picked = await $.ui.ask(q.question, { options, header: HEADER })
+      answers.push({ question: q.question, answer: picked === 'Skip' || picked === 'Not sure yet' ? '' : picked })
+    }
+
+    $.ui.status('✦ Prompt Master: writing a better prompt…')
+    const { improved, note } = await rewrite($, original, goal, answers)
+    $.ui.status(undefined)
+
+    $.ui.log(
+      `✦ Better prompt${note ? `\nWhat changed: ${note}` : ''}\n\n${improved}\n\n· Your original ·\n${original}`,
+    )
+    const choice = await $.ui.ask('What do you want to do with the better prompt?', {
+      options: ['Use this', 'Edit', 'Keep mine'],
+      header: HEADER,
+    })
+    if (choice === 'Use this') {
+      await putInBox($, improved, '✦ The better prompt is in your prompt box. Press send when you are ready.')
+    } else if (choice === 'Edit') {
+      await putInBox($, improved, '✦ The better prompt is in your prompt box. Change anything you like, then press send.')
+    } else if (choice === 'Keep mine') {
+      $.ui.log('✦ Prompt Master closed. Your own prompt is unchanged.')
+    } else {
+      // Typed under "Other": treat it as their own edited version.
+      await putInBox($, choice, '✦ Your version is in your prompt box. Press send when you are ready.')
+    }
+  } catch (err) {
+    $.ui.status(undefined)
+    // A dismissed question card rejects: that is the person closing it, not an error.
+    const message = err instanceof Error ? err.message : String(err)
+    $.ui.log(
+      /dismiss|cancel|reject/i.test(message)
+        ? '✦ Prompt Master closed. Nothing was changed or sent.'
+        : `✦ Prompt Master hit a problem: ${message} Nothing was sent.`,
+    )
   }
 }
 
@@ -215,6 +293,10 @@ export const register: Register = on => {
     if (text.trim() === '') {
       const where = seen.size > 0 ? `The ✦ Prompt Master button is being drawn in: ${[...seen].join(', ')}.` : 'No app has drawn the ✦ Prompt Master button in this session yet.'
       return { text: `${where} Type /prompt-master followed by your rough prompt, e.g. /prompt-master write a post about our launch` }
+    }
+    if (seen.size === 0) {
+      void startDialog($, text)
+      return { text: '✦ Prompt Master is reading your prompt. Up to 3 quick questions will pop up as cards. Nothing is sent until you press send.' }
     }
     void start($, text)
 
